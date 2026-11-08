@@ -1,0 +1,13 @@
+[ci] runner: ubuntu-latest (container)
+[ci] node: v20.18.0
+[ci] env: LANG=C.UTF-8
+[ci] env: TZ=
+[ci] npm ci ... done
+[ci] npm test
+ FAIL  tests/settlement.test.js > 정산 마감일 > 한국 시간 자정 직후 거래는 그날로 마감된다
+AssertionError: expected '2026-10-31' to be '2026-11-01'
+ FAIL  tests/settlement.test.js > 정산 마감일 > 마감 라벨
+AssertionError: expected '2026-10-31 마감' to be '2026-11-01 마감'
+ Test Files  1 failed (1)
+      Tests  2 failed (2)
+[ci] exit code 1

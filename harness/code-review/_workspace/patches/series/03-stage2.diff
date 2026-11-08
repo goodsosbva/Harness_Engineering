@@ -1,0 +1,230 @@
+From daadbce92e49a257e5916ec5935029506c9b221f Mon Sep 17 00:00:00 2001
+From: x <x>
+Date: Sun, 1 Nov 2026 15:46:38 +0900
+Subject: [PATCH] stage2
+
+---
+ .gitignore              |  1 +
+ api/check_http_guard.py |  9 +++++++++
+ api/check_verdict.py    | 36 ++++++++++++++++++++++++++++++++++++
+ api/codex_generator.py  |  2 +-
+ api/core.py             | 29 ++++++++++++++++++++---------
+ api/results.py          |  5 +++--
+ api/workflow.py         | 25 +++++++------------------
+ web/src/App.tsx         |  4 ++--
+ 8 files changed, 79 insertions(+), 32 deletions(-)
+ create mode 100644 .gitignore
+ create mode 100644 api/check_http_guard.py
+ create mode 100644 api/check_verdict.py
+
+diff --git a/api/check_verdict.py b/api/check_verdict.py
+new file mode 100644
+index 0000000..76fac19
+--- /dev/null
++++ b/api/check_verdict.py
+@@ -0,0 +1,36 @@
++"""skipped 테스트가 정책 통과로 집계되지 않는지 확인한다."""
++import json
++import re
++import shutil
++import tempfile
++import uuid
++from pathlib import Path
++
++import playwright_runner
++from results import summarize_results
++
++ROOT = playwright_runner.ROOT = Path(tempfile.mkdtemp())
++run_id, execution_id = uuid.uuid4().hex, uuid.uuid4().hex
++run = ROOT / ".local" / "runs" / run_id
++output = run / "executions" / execution_id
++output.mkdir(parents=True)
++try:
++    scenarios = [{"scenario_key": f"R@a.md:1-DENY-{n}", "expected_policy": "deny"} for n in (1, 2, 3)]
++    (run / "test-spec.json").write_text(json.dumps({"product": "p", "version": "v", "scope": "전체", "requirements": [{"requirement_key": "R@a.md:1", "scenarios": scenarios}]}), encoding="utf-8")
++    deny = {"actual_policy": "deny"}
++    case = lambda n, status: {"scenario_key": f"R@a.md:1-DENY-{n}", "requirement_key": "R@a.md:1", "expected_policy": "deny", "status": status, "observation": deny, "screenshots": [], "traces": []}
++    (output / "execution.json").write_text(json.dumps({"target_url": "http://127.0.0.1", "started_at": "", "finished_at": "", "status": "completed", "unexecuted": [], "counts": {"screenshots": 0, "capture_errors": 0},
++        "cases": [case(1, "passed"), case(2, "skipped"), case(3, "failed")]}), encoding="utf-8")
++    (output / "playwright.log").write_text("", encoding="utf-8")
++    report = summarize_results(run_id, execution_id, publish=False)
++    verdicts = {item["scenario_key"][-1]: (item["verdict"], item["classification"]) for item in report["cases"]}
++    assert verdicts == {"1": ("passed", "TN"), "2": ("unconfirmed", None), "3": ("failed", "TN")}, verdicts
++    assert report["summary"]["quadrants"]["TN"] == 2 and report["summary"]["unconfirmed"] == 1
++    assert set(report["artifacts"]) == {"execution.json", "playwright.log"}, report["artifacts"]
++finally:
++    shutil.rmtree(ROOT)
++
++listing = "  a.spec.ts:5:5 › K-ALLOW-10 제목\nTotal: 1 test in 1 file"
++assert not re.search(rf"› {re.escape('K-ALLOW-1')}(?: |$)", listing, re.M)
++assert re.search(rf"› {re.escape('K-ALLOW-10')}(?: |$)", listing, re.M)
++print("verdict ok")
+diff --git a/api/codex_generator.py b/api/codex_generator.py
+index 4c09e6a..a48b587 100644
+--- a/api/codex_generator.py
++++ b/api/codex_generator.py
+@@ -228,7 +228,7 @@ coverage.json must be {{"scenarios":[{{"scenario_key":"...", "status":"generated
+     generated_keys = set()
+     for item in coverage:
+         if item["status"] == "generated":
+-            if not item.get("checks") or item["scenario_key"] not in listing:
++            if not item.get("checks") or not re.search(rf"› {re.escape(item['scenario_key'])}(?: |$)", listing, re.M):
+                 raise RuntimeError("생성 시나리오의 판정 조건이나 테스트 파일이 누락됐습니다: " + item["scenario_key"])
+             generated_keys.add(item["scenario_key"])
+         elif item["status"] != "unsupported" or not item.get("reason", "").strip():
+diff --git a/api/core.py b/api/core.py
+index 936ec78..87db9eb 100644
+--- a/api/core.py
++++ b/api/core.py
+@@ -143,6 +143,25 @@ def index_version(product: str, version: str) -> dict:
+     return {"product": product, "version": version, "file_count": len(files), "chunk_count": len(rows)}
+ 
+ 
++def index_status(path: Path) -> tuple[bool, str]:
++    database = path / "embeddings.sqlite3"
++    if not database.is_file():
++        return False, "선택한 제품/버전의 임베딩이 없습니다."
++    try:
++        with closing(sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)) as db:
++            count = db.execute("SELECT count(*) FROM chunks").fetchone()[0]
++            stored_hashes = dict(db.execute("SELECT path, sha256 FROM source_files"))
++            metadata = dict(db.execute("SELECT key, value FROM metadata"))
++    except sqlite3.DatabaseError:
++        return False, "임베딩 DB를 읽지 못했습니다. 해당 버전을 다시 임베딩하십시오."
++    if metadata.get("chunking") != CHUNKING_VERSION or metadata.get("model") != MODEL_NAME:
++        return False, "임베딩 분할 방식이 변경되었습니다. 해당 버전을 다시 임베딩하십시오."
++    current_hashes = {file.relative_to(path).as_posix(): hashlib.sha256(file.read_bytes()).hexdigest() for file in source_files(path)}
++    if not count or current_hashes != stored_hashes:
++        return False, "원문이 임베딩 후 변경되었습니다. 먼저 해당 버전을 다시 임베딩하십시오."
++    return True, ""
++
++
+ def list_products() -> list[dict]:
+     if not DOCUMENTS.is_dir():
+         return []
+@@ -165,26 +184,18 @@ def list_products() -> list[dict]:
+                 continue
+             database = path / "embeddings.sqlite3"
+             count = 0
+-            stored_hashes = {}
+-            metadata = {}
+             if database.is_file():
+                 try:
+                     with closing(sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)) as db:
+                         count = db.execute("SELECT count(*) FROM chunks").fetchone()[0]
+-                        stored_hashes = dict(db.execute("SELECT path, sha256 FROM source_files"))
+-                        metadata = dict(db.execute("SELECT key, value FROM metadata"))
+                 except sqlite3.DatabaseError:
+                     pass
+-            current_hashes = {
+-                relative: hashlib.sha256((path / relative).read_bytes()).hexdigest()
+-                for relative in files
+-            }
+             products.append({
+                 "product": product.name,
+                 "version": version.name,
+                 "files": files,
+                 "reference_files": reference_files,
+-                "indexed": count > 0 and current_hashes == stored_hashes and metadata.get("chunking") == CHUNKING_VERSION,
++                "indexed": index_status(path)[0],
+                 "chunk_count": count,
+             })
+     return products
+diff --git a/api/results.py b/api/results.py
+index 3fb7ad4..e504c85 100644
+--- a/api/results.py
++++ b/api/results.py
+@@ -43,7 +43,8 @@ def summarize_results(run_id: str, execution_id: str, *, publish: bool = True) -
+         actual = observation.get("actual_policy", "unknown")
+         if actual not in {"allow", "deny"}:
+             actual = "unknown"
+-        quadrant = classify(case["expected_policy"], actual, infrastructure)
++        # 실행되지 않은(skipped) 테스트의 관찰값으로 정책을 판정하지 않는다.
++        quadrant = None if case["status"] == "skipped" else classify(case["expected_policy"], actual, infrastructure)
+         policy_mismatch = quadrant in {"FN", "FP"}
+         failed = case["status"] in {"failed", "timedOut"} or policy_mismatch or bool(case.get("capture_error"))
+         verdict = "execution_error" if infrastructure else "failed" if failed else "unconfirmed" if quadrant is None else "passed"
+@@ -84,7 +85,7 @@ def summarize_results(run_id: str, execution_id: str, *, publish: bool = True) -
+         "unexecuted": unexecuted,
+         "unresolved": [{**item, "requirement_title": requirements.get(item["requirement_key"], {}).get("title", "요구사항")} for item in spec.get("unresolved", [])],
+         "test_sources": [{**source, "url": base + "test-source/" + quote(source["file"])} for source in execution.get("test_sources", [])],
+-        "artifacts": {name: base + name for name in ("execution.json", "failures.json", "playwright-results.json", "playwright.log")},
++        "artifacts": {name: base + name for name in ("execution.json", "failures.json", "playwright-results.json", "playwright.log", "launch-error.txt") if (output / name).is_file()},
+     }
+     save_json(output / "report.json", report)
+     if publish:
+diff --git a/api/workflow.py b/api/workflow.py
+index 6a677b5..33dd2d3 100644
+--- a/api/workflow.py
++++ b/api/workflow.py
+@@ -1,4 +1,3 @@
+-import hashlib
+ import json
+ import math
+ import os
+@@ -55,21 +54,11 @@ def _load_env() -> None:
+ 
+ def _requirements(product: str, version: str) -> list[dict]:
+     folder = core.version_path(product, version)
+-    database = folder / "embeddings.sqlite3"
+-    if not database.is_file():
+-        raise ValueError("선택한 제품/버전의 임베딩이 없습니다.")
+-
+-    with sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True) as db:
+-        metadata = dict(db.execute("SELECT key, value FROM metadata"))
+-        if metadata.get("chunking") != core.CHUNKING_VERSION or metadata.get("model") != core.MODEL_NAME:
+-            raise ValueError("임베딩 분할 방식이 변경되었습니다. 해당 버전을 다시 임베딩하십시오.")
+-        stored_hashes = dict(db.execute("SELECT path, sha256 FROM source_files"))
+-        current_hashes = {
+-            relative: hashlib.sha256((folder / relative).read_bytes()).hexdigest()
+-            for relative in stored_hashes
+-        }
+-        if not stored_hashes or current_hashes != stored_hashes:
+-            raise ValueError("원문이 임베딩 후 변경되었습니다. 먼저 해당 버전을 다시 임베딩하십시오.")
++    ready, reason = core.index_status(folder)
++    if not ready:
++        raise ValueError(reason)
++
++    with sqlite3.connect(f"file:{(folder / 'embeddings.sqlite3').as_posix()}?mode=ro", uri=True) as db:
+         rows = db.execute(
+             "SELECT path, paragraph_no, chunk_no, content, embedding "
+             "FROM chunks ORDER BY path, paragraph_no, chunk_no"
+@@ -135,11 +124,11 @@ def retrieve_evidence(state: HandoffState) -> dict:
+     scope = (state.get("scope") or "").strip()
+     if not scope:
+         raise ValueError("검사 범위를 입력하십시오.")
+-    if scope in {"", "전체", "all", "ALL"}:
++    if scope in {"전체", "all", "ALL"}:
+         selected = records
+     elif scope in SECTIONS:
+         selected = [item for item in records if item["section"] == scope]
+-    elif re.fullmatch(r"[A-Z][A-Z0-9_]+", scope):
++    elif re.fullmatch(r"[A-Z][A-Z0-9_]+", scope) and any(item["requirement_id"] == scope for item in records):
+         selected = [item for item in records if item["requirement_id"] == scope]
+     else:
+         compact_scope = re.sub(r"\s+", "", scope).casefold()
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index 0caffd0..1c312c3 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -17,7 +17,7 @@ function date(value: string) { return new Date(value).toLocaleString('ko-KR', {
+ function message(error: unknown) { return error instanceof Error ? error.message : String(error); }
+ async function api<T>(path: string, init?: RequestInit): Promise<T> {
+   const response = await fetch('/api' + path, init);
+-  const data = await response.json();
++  const data = await response.json().catch(() => ({}));
+   if (!response.ok) throw Error(typeof data.detail === 'string' ? data.detail : '요청을 처리하지 못했습니다.');
+   return data as T;
+ }
+@@ -127,7 +127,7 @@ export default function App() {
+       <aside className="panel history"><div className="section-heading"><h2>작업 기록</h2><span className="counter">{runs.length}</span></div><p className="hint">작업을 고른 뒤 개별 실행을 확인하세요.</p><nav aria-label="작업 기록">{runs.map(item => <button key={item.run_id} className={`run-item ${runId === item.run_id ? 'selected' : ''}`} onClick={() => { setRunId(item.run_id); setError(''); }} aria-current={runId === item.run_id ? 'true' : undefined}><span className="run-title">{item.product || '제품 미지정'} <small>{item.version}</small></span><time>{date(item.created_at)}</time><span className="run-meta">{item.scenario_count}개 상황 / {item.executions.length}회 실행</span><span className={`badge ${item.status === 'error' ? 'failed' : ''}`}>{statusNames[item.status] || item.status}</span><code>{item.run_id.slice(0, 8)}</code></button>)}</nav>{!runs.length && <p>아직 작업 기록이 없습니다.</p>}</aside>
+       <section className="results-area" aria-label="실행 결과">
+         {run && <section className="panel run-progress"><div className="section-heading"><h2>{run.product} / {run.version}</h2><span className={`badge ${run.status === 'error' ? 'failed' : ''}`}>{statusNames[run.status] || run.status}</span></div><ol className="pipeline">{nodes.map(([id, label], index) => <li key={id} className={`${index < nodeIndex || run.status === 'completed' ? 'done' : ''} ${index === nodeIndex && run.status !== 'completed' ? 'active' : ''}`}><span>{index + 1}</span>{label}</li>)}</ol>{run.error && <p className="alert danger">{run.error}</p>}{['running', 'queued'].includes(run.status) && <p className="hint" role="status">진행 중입니다. 3초마다 상태를 갱신합니다.</p>}<code className="run-id">작업 ID {run.run_id}</code></section>}
+-        {run && !!run.executions.length && <section className="panel execution-picker"><label>실행 기록<select aria-label="실행 기록" value={executionId} onChange={event => setExecutionId(event.target.value)}>{run.executions.map(item => <option key={item.execution_id} value={item.execution_id}>{date(item.started_at)} / {item.target_url} / {item.counts.passed} 통과, {item.counts.failed} 실패 / {item.execution_id.slice(0, 8)}</option>)}</select></label><button className="secondary" onClick={rerun} disabled={!!busy || !report || running}>{busy === 'execute' ? '브라우저 실행 중...' : '같은 코드 다시 실행'}</button></section>}
++        {run && !!run.executions.length && <section className="panel execution-picker"><label>실행 기록<select aria-label="실행 기록" value={executionId} onChange={event => setExecutionId(event.target.value)}>{run.executions.map(item => <option key={item.execution_id} value={item.execution_id}>{date(item.started_at)} / {item.target_url} / {item.summary ? `${item.summary.test_passed} 통과, ${item.summary.failed} 점검 실패` : `${item.counts.passed} 통과, ${item.counts.failed} 실패`} / {item.execution_id.slice(0, 8)}</option>)}</select></label><button className="secondary" onClick={rerun} disabled={!!busy || !report || running}>{busy === 'execute' ? '브라우저 실행 중...' : '같은 코드 다시 실행'}</button></section>}
+         {loading && <p className="panel" role="status">실행 결과를 읽고 있습니다...</p>}
+         {report && summary && <>
+           <section className="panel report-overview"><div className="section-heading"><div><p className="eyebrow">실행 요약</p><h2>{report.status === 'not_run' ? '이 앱에서 실행할 수 있는 상황이 없습니다' : summary.failed ? `${summary.failed}개 점검 실패` : report.status === 'execution_error' || summary.execution_errors ? '실행을 완료하지 못했습니다' : '실행한 점검을 모두 통과했습니다'}</h2></div><span className={`badge ${report.status === 'not_run' ? '' : summary.failed || summary.execution_errors ? 'failed' : 'passed'}`}>{report.status === 'not_run' ? '미실행' : summary.failed || summary.execution_errors ? '확인 필요' : '실행 완료'}</span></div><p className="target-url">{report.target_url}</p><p className="hint">실행 ID <code>{report.execution_id}</code> / {date(report.started_at)}</p>{report.error && <p className="alert danger" role="alert">{report.error}</p>}<div className="metrics">{[['계획 상황', summary.planned], ['실행', summary.executed], ['Playwright 통과', summary.test_passed], ['점검 실패', summary.failed], ['스크린샷', summary.screenshots], ['미실행', summary.unexecuted]].map(([label, count]) => <div key={label} className={label === '점검 실패' && summary.failed ? 'metric-failed' : ''}><strong>{count}</strong><span>{label}</span></div>)}</div><div className="quadrants">{Object.keys(quadrants).map(name => <button key={name} className={`${name} ${filter === name ? 'chosen' : ''}`} aria-pressed={filter === name} onClick={() => setFilter(filter === name ? 'all' : name)}><span>{name}</span><strong>{summary.quadrants[name]}</strong><small>{quadrants[name]}</small></button>)}</div><p className="classification-note">정책 판정과 상세 점검은 별개입니다. TN이어도 문구, 색상, 위치가 다르면 점검 실패로 표시됩니다.</p><div className="subcounts"><button onClick={() => setFilter('unconfirmed')}>정책 미확인 <strong>{summary.unconfirmed}</strong></button><button onClick={() => setFilter('execution_error')}>실행 오류 <strong>{summary.execution_errors}</strong></button><span>캡처 오류 <strong>{summary.capture_errors}</strong></span></div></section>
+-- 
+2.42.0.windows.2
+

@@ -1,0 +1,402 @@
+From c57d4d9d7e456e8cf2135f008dca0863bb26a261 Mon Sep 17 00:00:00 2001
+From: x <x>
+Date: Sun, 1 Nov 2026 15:52:51 +0900
+Subject: [PATCH] stage4
+
+---
+ api/check_target_url.py  |  3 ++-
+ api/check_verdict.py     |  6 ++++--
+ api/codex_generator.py   | 11 +++--------
+ api/core.py              |  2 +-
+ api/main.py              |  2 +-
+ api/page_inspector.py    |  3 +--
+ api/playwright_runner.py | 25 +++----------------------
+ api/results.py           | 19 ++++---------------
+ api/storage.py           | 37 +++++++++++++++++++++++++++++++++++++
+ api/workflow.py          | 35 ++++++++++-------------------------
+ web/src/App.tsx          |  2 +-
+ 11 files changed, 67 insertions(+), 78 deletions(-)
+ create mode 100644 api/storage.py
+
+diff --git a/api/check_target_url.py b/api/check_target_url.py
+index c1024a9..9fa91e3 100644
+--- a/api/check_target_url.py
++++ b/api/check_target_url.py
+@@ -10,6 +10,7 @@ import main
+ import workflow
+ import playwright_runner
+ import codex_generator
++import storage
+ from target_url import validate_target_url
+ 
+ valid=['http://localhost:8765/product-demo.html','http://127.0.0.1:8765/','https://example.com','https://shop.example.com/cart?item=1#details','http://192.168.1.5:8080/','http://[::1]:8765/']
+@@ -45,7 +46,7 @@ with tempfile.TemporaryDirectory() as temporary:
+     # Check generation URL acceptance before it stops on an intentionally empty specification.
+     nested=folder/'.local/runs'/('b'*32);nested.mkdir(parents=True)
+     (nested/'test-spec.json').write_text(json.dumps({'target_url':'https://example.com','requirements':[]}),encoding='utf-8')
+-    with patch.object(codex_generator,'ROOT',folder):
++    with patch.object(storage,'RUNS',folder/'.local/runs'):
+         try:codex_generator.generate_playwright('b'*32)
+         except ValueError as error:assert str(error)=='Playwright 코드로 바꿀 요구사항이 없습니다.'
+         else:raise AssertionError('Expected empty-spec validation')
+diff --git a/api/check_verdict.py b/api/check_verdict.py
+index 76fac19..70fc0ef 100644
+--- a/api/check_verdict.py
++++ b/api/check_verdict.py
+@@ -6,10 +6,11 @@ import tempfile
+ import uuid
+ from pathlib import Path
+ 
+-import playwright_runner
++import storage
+ from results import summarize_results
+ 
+-ROOT = playwright_runner.ROOT = Path(tempfile.mkdtemp())
++ROOT = Path(tempfile.mkdtemp())
++storage.RUNS = ROOT / ".local" / "runs"
+ run_id, execution_id = uuid.uuid4().hex, uuid.uuid4().hex
+ run = ROOT / ".local" / "runs" / run_id
+ output = run / "executions" / execution_id
+@@ -23,6 +24,7 @@ try:
+         "cases": [case(1, "passed"), case(2, "skipped"), case(3, "failed")]}), encoding="utf-8")
+     (output / "playwright.log").write_text("", encoding="utf-8")
+     report = summarize_results(run_id, execution_id, publish=False)
++    assert not (output / "report.json").exists()
+     verdicts = {item["scenario_key"][-1]: (item["verdict"], item["classification"]) for item in report["cases"]}
+     assert verdicts == {"1": ("passed", "TN"), "2": ("unconfirmed", None), "3": ("failed", "TN")}, verdicts
+     assert report["summary"]["quadrants"]["TN"] == 2 and report["summary"]["unconfirmed"] == 1
+diff --git a/api/codex_generator.py b/api/codex_generator.py
+index a48b587..c36136e 100644
+--- a/api/codex_generator.py
++++ b/api/codex_generator.py
+@@ -12,10 +12,7 @@ from pathlib import Path
+ from target_url import validate_target_url
+ from page_inspector import inspect_target
+ from playwright_runner import check_spec_source, child_env
+-
+-
+-ROOT = Path(__file__).resolve().parents[1]
+-RUN_ID_PATTERN = re.compile(r"^[a-f0-9]{32}$")
++from storage import ROOT, run_folder, save_json
+ 
+ 
+ class CodexAppServer:
+@@ -138,9 +135,7 @@ class CodexAppServer:
+ 
+ 
+ def generate_playwright(run_id: str) -> dict:
+-    if not RUN_ID_PATTERN.fullmatch(run_id):
+-        raise ValueError("실행 ID 형식이 올바르지 않습니다.")
+-    run_dir = ROOT / ".local" / "runs" / run_id
++    run_dir = run_folder(run_id)
+     spec_path = run_dir / "test-spec.json"
+     if not spec_path.is_file():
+         raise FileNotFoundError("해당 실행의 test-spec.json을 찾지 못했습니다.")
+@@ -265,5 +260,5 @@ coverage.json must be {{"scenarios":[{{"scenario_key":"...", "status":"generated
+         "playwright_list_output": listing,
+         "codex_summary": message,
+     }
+-    (run_dir / "generation.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
++    save_json(run_dir / "generation.json", record)
+     return record
+diff --git a/api/core.py b/api/core.py
+index 87db9eb..25391a9 100644
+--- a/api/core.py
++++ b/api/core.py
+@@ -14,8 +14,8 @@ from pathlib import Path
+ 
+ from fastembed import TextEmbedding
+ 
++from storage import ROOT
+ 
+-ROOT = Path(__file__).resolve().parents[1]
+ DOCUMENTS = ROOT / "documents"
+ MODEL_CACHE = ROOT / ".local" / "models"
+ MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+diff --git a/api/main.py b/api/main.py
+index 899f99c..1982aef 100644
+--- a/api/main.py
++++ b/api/main.py
+@@ -8,7 +8,7 @@ import json
+ from core import index_version, list_products
+ from workflow import run_handoff, run_generation, run_execution, prepare_pipeline, execute_pipeline, interrupt_pending_runs
+ from results import list_runs, run_detail, summarize_results
+-from playwright_runner import execution_folder
++from storage import execution_folder
+ 
+ 
+ @asynccontextmanager
+diff --git a/api/page_inspector.py b/api/page_inspector.py
+index 3e64252..68e37fe 100644
+--- a/api/page_inspector.py
++++ b/api/page_inspector.py
+@@ -6,8 +6,7 @@ from pathlib import Path
+ 
+ from target_url import check_target_host, validate_target_url
+ from playwright_runner import child_env
+-
+-ROOT = Path(__file__).resolve().parents[1]
++from storage import ROOT
+ 
+ 
+ def inspect_target(target_url: str, output: Path) -> dict:
+diff --git a/api/playwright_runner.py b/api/playwright_runner.py
+index 2d16a8a..43ffead 100644
+--- a/api/playwright_runner.py
++++ b/api/playwright_runner.py
+@@ -10,9 +10,9 @@ from datetime import datetime, timezone
+ from pathlib import Path
+ from target_url import check_target_host, validate_target_url
+ from urllib.request import urlopen
++from storage import ROOT, run_folder, save_json
+ 
+ 
+-ROOT = Path(__file__).resolve().parents[1]
+ # 생성 코드가 실행되는 하위 프로세스에는 이 목록의 환경변수만 넘긴다.
+ CHILD_ENV_KEYS = (
+     "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TEMP", "TMP",
+@@ -43,25 +43,6 @@ def check_spec_source(name: str, content: str) -> None:
+         raise RuntimeError(f"생성 테스트에 허용되지 않은 코드가 있습니다: {name}: {found.group(0)}")
+ 
+ 
+-def run_folder(run_id: str) -> Path:
+-    if not re.fullmatch(r"[a-f0-9]{32}", run_id):
+-        raise ValueError("실행 ID 형식이 올바르지 않습니다.")
+-    folder = ROOT / ".local" / "runs" / run_id
+-    if not folder.is_dir() or not folder.resolve().is_relative_to((ROOT / ".local" / "runs").resolve()):
+-        raise FileNotFoundError("실행 폴더를 찾지 못했습니다.")
+-    return folder
+-
+-
+-def execution_folder(run_id: str, execution_id: str) -> Path:
+-    parent = run_folder(run_id) / "executions"
+-    if not re.fullmatch(r"[a-f0-9]{32}", execution_id):
+-        raise ValueError("점검 ID 형식이 올바르지 않습니다.")
+-    folder = parent / execution_id
+-    if not folder.is_dir() or not folder.resolve().is_relative_to(parent.resolve()):
+-        raise FileNotFoundError("점검 결과를 찾지 못했습니다.")
+-    return folder
+-
+-
+ def _specs(suite: dict):
+     yield from suite.get("specs", [])
+     for child in suite.get("suites", []):
+@@ -201,8 +182,8 @@ def run_playwright(run_id: str, target_url: str | None = None) -> dict:
+         "unexecuted": len(record["unexecuted"]),
+     }
+     failed_cases = [case for case in record["cases"] if case["status"] in {"failed", "timedOut"}]
+-    (output / "failures.json").write_text(json.dumps(failed_cases, ensure_ascii=False, indent=2), encoding="utf-8")
++    save_json(output / "failures.json", failed_cases)
+     record["failure_report"] = "failures.json"
+     record["finished_at"] = datetime.now(timezone.utc).isoformat()
+-    (output / "execution.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
++    save_json(output / "execution.json", record)
+     return record
+diff --git a/api/results.py b/api/results.py
+index e504c85..bc8cdb9 100644
+--- a/api/results.py
++++ b/api/results.py
+@@ -1,27 +1,16 @@
+ import json
+ import re
+-import uuid
+ from datetime import datetime, timezone
+ from pathlib import Path
+ from urllib.parse import quote
+ 
+-from core import ROOT
+-from playwright_runner import run_folder, execution_folder
++from storage import RUN_ID, RUNS, execution_folder, run_folder, save_json
+ 
+ 
+ QUADRANTS = {("allow", "allow"): "TP", ("allow", "deny"): "FN", ("deny", "allow"): "FP", ("deny", "deny"): "TN"}
+ ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+ 
+ 
+-def save_json(path: Path, value: dict) -> None:
+-    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+-    try:
+-        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+-        temporary.replace(path)
+-    finally:
+-        temporary.unlink(missing_ok=True)
+-
+-
+ def classify(expected: str, actual: str | None, execution_error: bool = False) -> str | None:
+     return None if execution_error else QUADRANTS.get((expected, actual))
+ 
+@@ -87,8 +76,8 @@ def summarize_results(run_id: str, execution_id: str, *, publish: bool = True) -
+         "test_sources": [{**source, "url": base + "test-source/" + quote(source["file"])} for source in execution.get("test_sources", [])],
+         "artifacts": {name: base + name for name in ("execution.json", "failures.json", "playwright-results.json", "playwright.log", "launch-error.txt") if (output / name).is_file()},
+     }
+-    save_json(output / "report.json", report)
+     if publish:
++        save_json(output / "report.json", report)
+         latest_file = folder / "report.json"
+         latest = json.loads(latest_file.read_text(encoding="utf-8")) if latest_file.is_file() else {}
+         if not latest or latest.get("started_at", "") <= report["started_at"]:
+@@ -129,8 +118,8 @@ def run_detail(run_id: str) -> dict:
+ 
+ def list_runs() -> list[dict]:
+     rows = []
+-    for folder in (ROOT / ".local" / "runs").glob("*"):
+-        if not folder.is_dir() or not re.fullmatch(r"[a-f0-9]{32}", folder.name):
++    for folder in RUNS.glob("*"):
++        if not folder.is_dir() or not RUN_ID.fullmatch(folder.name):
+             continue
+         try:
+             rows.append(run_detail(folder.name))
+diff --git a/api/storage.py b/api/storage.py
+new file mode 100644
+index 0000000..926a50c
+--- /dev/null
++++ b/api/storage.py
+@@ -0,0 +1,37 @@
++"""실행 기록(.local/runs)의 경로 검증과 JSON 저장을 한곳에서 다룬다."""
++import json
++import re
++import uuid
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++RUNS = ROOT / ".local" / "runs"
++RUN_ID = re.compile(r"[a-f0-9]{32}")
++
++
++def save_json(path: Path, value) -> None:
++    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
++    try:
++        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
++        temporary.replace(path)
++    finally:
++        temporary.unlink(missing_ok=True)
++
++
++def run_folder(run_id: str) -> Path:
++    if not RUN_ID.fullmatch(run_id):
++        raise ValueError("실행 ID 형식이 올바르지 않습니다.")
++    folder = RUNS / run_id
++    if not folder.is_dir() or not folder.resolve().is_relative_to(RUNS.resolve()):
++        raise FileNotFoundError("실행 폴더를 찾지 못했습니다.")
++    return folder
++
++
++def execution_folder(run_id: str, execution_id: str) -> Path:
++    parent = run_folder(run_id) / "executions"
++    if not RUN_ID.fullmatch(execution_id):
++        raise ValueError("점검 ID 형식이 올바르지 않습니다.")
++    folder = parent / execution_id
++    if not folder.is_dir() or not folder.resolve().is_relative_to(parent.resolve()):
++        raise FileNotFoundError("점검 결과를 찾지 못했습니다.")
++    return folder
+diff --git a/api/workflow.py b/api/workflow.py
+index cd0d6b3..11f6b1d 100644
+--- a/api/workflow.py
++++ b/api/workflow.py
+@@ -15,11 +15,11 @@ from langgraph.graph import END, START, StateGraph
+ 
+ import core
+ from codex_generator import generate_playwright as create_playwright
+-from playwright_runner import run_playwright as execute_playwright, run_folder
+-from results import summarize_results as create_report, save_json
++from playwright_runner import run_playwright as execute_playwright
++from results import summarize_results as create_report
++from storage import ROOT, RUNS, run_folder, save_json
+ 
+ 
+-ROOT = Path(__file__).resolve().parents[1]
+ SECTIONS = ("회원", "상품", "장바구니", "주문", "리뷰", "커뮤니티", "추천", "알림", "관리자", "메인", "고도화")
+ 
+ 
+@@ -164,7 +164,7 @@ def retrieve_evidence(state: HandoffState) -> dict:
+         "requirements": public_records,
+     }
+     output_dir = Path(state["output_dir"])
+-    (output_dir / "evidence.json").write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8")
++    save_json(output_dir / "evidence.json", evidence)
+     return {"evidence": evidence}
+ 
+ 
+@@ -354,22 +354,18 @@ def build_handoff(state: HandoffState) -> dict:
+         "unresolved": overall_unresolved,
+     }
+     output_dir = Path(state["output_dir"])
+-    (output_dir / "test-spec.json").write_text(json.dumps(test_spec, ensure_ascii=False, indent=2), encoding="utf-8")
++    save_json(output_dir / "test-spec.json", test_spec)
+     return {"test_spec": test_spec}
+ 
+ def _progress(state: HandoffState, node: str) -> None:
+-    file = run_folder(state["run_id"]) / "pipeline.json"
+-    previous = json.loads(file.read_text(encoding="utf-8")) if file.is_file() else {"run_id": state["run_id"]}
+-    save_json(file, {**previous, "status": "running", "current_node": node, "error": None})
++    _finish_status(state["run_id"], "running", current_node=node, error=None)
+ 
+ 
+ def summarize_results(state: HandoffState) -> dict:
+     _progress(state, "summarize_results")
+     execution_id = state.get("execution_id") or state["execution"]["execution_id"]
+     report = create_report(state["run_id"], execution_id)
+-    file = ROOT / ".local" / "runs" / state["run_id"] / "pipeline.json"
+-    previous = json.loads(file.read_text(encoding="utf-8"))
+-    save_json(file, {**previous, "status": report["status"], "current_node": "summarize_results", "latest_execution_id": execution_id})
++    _finish_status(state["run_id"], report["status"], current_node="summarize_results", latest_execution_id=execution_id)
+     return {"report": report}
+ 
+ 
+@@ -437,7 +433,7 @@ def run_execution(run_id: str, target_url: str | None = None) -> dict:
+ 
+ 
+ def _finish_status(run_id: str, status: str, **fields) -> dict:
+-    file = ROOT / ".local" / "runs" / run_id / "pipeline.json"
++    file = run_folder(run_id) / "pipeline.json"
+     previous = json.loads(file.read_text(encoding="utf-8")) if file.is_file() else {"run_id": run_id}
+     record = {**previous, "status": status, **fields}
+     save_json(file, record)
+@@ -450,7 +446,7 @@ def prepare_pipeline(product: str, version: str, target_url: str, scope: str) ->
+     if not scope.strip():
+         raise ValueError("검사 범위가 비었습니다.")
+     run_id = uuid.uuid4().hex
+-    output_dir = ROOT / ".local" / "runs" / run_id
++    output_dir = RUNS / run_id
+     output_dir.mkdir(parents=True, exist_ok=False)
+     state = {"product": product, "version": version, "target_url": target_url, "scope": scope, "run_id": run_id, "output_dir": str(output_dir)}
+     save_json(output_dir / "pipeline.json", {**state, "status": "queued", "current_node": None, "created_at": datetime.now(timezone.utc).isoformat()})
+@@ -466,21 +462,10 @@ def execute_pipeline(state: dict) -> dict:
+ 
+ 
+ def interrupt_pending_runs() -> None:
+-    for file in (ROOT / ".local" / "runs").glob("*/pipeline.json"):
++    for file in RUNS.glob("*/pipeline.json"):
+         try:
+             record = json.loads(file.read_text(encoding="utf-8"))
+             if record.get("status") in {"running", "queued"}:
+                 save_json(file, {**record, "status": "error", "error": "API가 재시작되어 이전 작업이 중단됐습니다. 저장된 실행 결과는 계속 열람할 수 있습니다."})
+         except (OSError, ValueError):
+             continue
+-
+-
+-def run_pipeline(product: str, version: str, target_url: str, scope: str) -> dict:
+-    return execute_pipeline(prepare_pipeline(product, version, target_url, scope))
+-
+-
+-
+-def run_summary(run_id: str, execution_id: str) -> dict:
+-    from playwright_runner import execution_folder
+-    execution_folder(run_id, execution_id)
+-    return WORKFLOW_GRAPH.invoke({"run_id": run_id, "start_at": "summarize_results", "execution_id": execution_id})["report"]
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index 1c312c3..e76bcfa 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -11,7 +11,7 @@ type Report = { run_id: string; execution_id: string; product: string; version:
+ const nodes = [['retrieve_evidence', '근거 검색'], ['build_handoff', '명세 작성'], ['generate_playwright', '코드 생성'], ['run_playwright', '브라우저 실행'], ['summarize_results', '결과 집계']];
+ const verdicts: Record<string, string> = { passed: '통과', failed: '실패', unconfirmed: '정책 미확인', execution_error: '실행 오류' };
+ const policies: Record<string, string> = { allow: '허용', deny: '거부', unknown: '미확인' };
+-const statusNames: Record<string, string> = { queued: '대기', running: '진행 중', completed: '완료', not_run: '미실행', unsupported: '해당 화면 없음', error: '작업 중단', execution_error: '실행 오류', generated: '코드 준비', handoff: '명세 준비', empty: '자료 없음' };
++const statusNames: Record<string, string> = { queued: '대기', running: '진행 중', completed: '완료', not_run: '미실행', error: '작업 중단', execution_error: '실행 오류', generated: '코드 준비', handoff: '명세 준비', empty: '자료 없음' };
+ const quadrants: Record<string, string> = { TP: '허용 기대 → 실제 허용', FN: '허용 기대 → 실제 거부', FP: '거부 기대 → 실제 허용', TN: '거부 기대 → 실제 거부' };
+ function date(value: string) { return new Date(value).toLocaleString('ko-KR', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
+ function message(error: unknown) { return error instanceof Error ? error.message : String(error); }
+-- 
+2.42.0.windows.2
+

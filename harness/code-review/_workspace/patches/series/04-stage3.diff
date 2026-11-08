@@ -1,0 +1,143 @@
+From 3045ce8efcd37edc6fd1c12a0c5b5bf5aabe9817 Mon Sep 17 00:00:00 2001
+From: x <x>
+Date: Sun, 1 Nov 2026 15:47:45 +0900
+Subject: [PATCH] stage3
+
+---
+ api/check_target_host.py | 22 ++++++++++++++++++++++
+ api/page_inspector.py    |  6 +++---
+ api/playwright_runner.py |  4 +++-
+ api/target_url.py        | 21 ++++++++++++++++++++-
+ api/workflow.py          |  2 +-
+ 5 files changed, 49 insertions(+), 6 deletions(-)
+ create mode 100644 api/check_target_host.py
+
+diff --git a/api/check_target_host.py b/api/check_target_host.py
+new file mode 100644
+index 0000000..3669e65
+--- /dev/null
++++ b/api/check_target_host.py
+@@ -0,0 +1,22 @@
++"""대상 호스트 검사: 메타데이터 주소는 항상 차단, 내부 주소는 opt-in일 때만 허용한다."""
++import os
++
++from target_url import check_target_host
++
++
++def rejected(url: str) -> bool:
++    try:
++        check_target_host(url)
++    except ValueError:
++        return True
++    return False
++
++
++os.environ.pop("COMMON_TESTER_ALLOW_PRIVATE", None)
++assert rejected("http://169.254.169.254/latest/meta-data/")
++assert rejected("http://127.0.0.1:8765/") and rejected("http://localhost:8765/") and rejected("http://10.0.0.5/")
++assert not rejected("http://8.8.8.8/")
++os.environ["COMMON_TESTER_ALLOW_PRIVATE"] = "1"
++assert not rejected("http://127.0.0.1:8765/") and not rejected("http://192.168.1.5:8080/")
++assert rejected("http://169.254.169.254/latest/meta-data/")
++print("target host ok")
+diff --git a/api/page_inspector.py b/api/page_inspector.py
+index b8ff029..3e64252 100644
+--- a/api/page_inspector.py
++++ b/api/page_inspector.py
+@@ -4,14 +4,14 @@ import shutil
+ import subprocess
+ from pathlib import Path
+ 
+-from target_url import validate_target_url
++from target_url import check_target_host, validate_target_url
+ from playwright_runner import child_env
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ 
+ 
+ def inspect_target(target_url: str, output: Path) -> dict:
+-    target_url = validate_target_url(target_url)
++    target_url = check_target_host(validate_target_url(target_url))
+     node = shutil.which('node.exe') or shutil.which('node')
+     if not node:
+         raise RuntimeError('Node.js 실행 파일이 없습니다.')
+@@ -24,7 +24,7 @@ def inspect_target(target_url: str, output: Path) -> dict:
+         raise RuntimeError('대상 화면을 읽지 못했습니다: ' + result.stderr[-2500:])
+     try:
+         metadata = json.loads(result.stdout)
+-        validate_target_url(metadata['final_url'])
++        check_target_host(validate_target_url(metadata['final_url']))
+         return metadata
+     except (KeyError, ValueError) as error:
+         raise RuntimeError('대상 화면 수집 결과 형식이 올바르지 않습니다.') from error
+diff --git a/api/playwright_runner.py b/api/playwright_runner.py
+index de69676..2d16a8a 100644
+--- a/api/playwright_runner.py
++++ b/api/playwright_runner.py
+@@ -8,7 +8,7 @@ import subprocess
+ import uuid
+ from datetime import datetime, timezone
+ from pathlib import Path
+-from target_url import validate_target_url
++from target_url import check_target_host, validate_target_url
+ from urllib.request import urlopen
+ 
+ 
+@@ -107,6 +107,8 @@ def run_playwright(run_id: str, target_url: str | None = None) -> dict:
+         try:
+             for file in files:
+                 check_spec_source(file.name, file.read_text(encoding="utf-8"))
++            # ponytail: 시작 주소만 검사한다. 테스트 중 리다이렉트/하위 요청까지 막으려면 page.route 검사가 필요하다.
++            check_target_host(target)
+             with urlopen(target, timeout=10) as response:
+                 if response.status != 200:
+                     raise RuntimeError(f"대상 앱 응답이 200이 아닙니다: {response.status}")
+diff --git a/api/target_url.py b/api/target_url.py
+index 8fb86d0..3a361ae 100644
+--- a/api/target_url.py
++++ b/api/target_url.py
+@@ -1,4 +1,7 @@
+-"""Validate target URL syntax without connecting to the target."""
++"""Validate target URL syntax, and check the resolved host before connecting."""
++import ipaddress
++import os
++import socket
+ from urllib.parse import urlsplit
+ 
+ 
+@@ -16,3 +19,19 @@ def validate_target_url(value: str) -> str:
+     if not valid:
+         raise ValueError('테스트 주소는 호스트가 있는 HTTP 또는 HTTPS URL이어야 합니다. 주소에 계정 정보는 넣을 수 없습니다.')
+     return value
++
++
++def check_target_host(value: str) -> str:
++    """링크로컬(클라우드 메타데이터 포함)은 항상, 사설망과 루프백은 COMMON_TESTER_ALLOW_PRIVATE=1일 때만 허용한다."""
++    host = urlsplit(value).hostname
++    try:
++        addresses = {info[4][0].split("%")[0] for info in socket.getaddrinfo(host, None)}
++    except (socket.gaierror, UnicodeError) as error:
++        raise ValueError(f"테스트 주소의 호스트를 찾지 못했습니다: {host}") from error
++    allow_private = os.getenv("COMMON_TESTER_ALLOW_PRIVATE") == "1"
++    for address in map(ipaddress.ip_address, addresses):
++        if address.is_link_local or address.is_multicast or address.is_unspecified or address.is_reserved:
++            raise ValueError(f"접근할 수 없는 주소입니다: {host} ({address})")
++        if (address.is_private or address.is_loopback) and not allow_private:
++            raise ValueError(f"내부 주소입니다. 로컬 앱을 검사하려면 .env에 COMMON_TESTER_ALLOW_PRIVATE=1을 설정하십시오: {host}")
++    return value
+diff --git a/api/workflow.py b/api/workflow.py
+index 33dd2d3..cd0d6b3 100644
+--- a/api/workflow.py
++++ b/api/workflow.py
+@@ -48,7 +48,7 @@ def _load_env() -> None:
+     for line in env_file.read_text(encoding="utf-8-sig").splitlines():
+         key, separator, value = line.partition("=")
+         key = key.strip()
+-        if separator and key in {"OPENAI_API_KEY", "OPENAI_MODEL"} and key not in os.environ:
++        if separator and key in {"OPENAI_API_KEY", "OPENAI_MODEL", "COMMON_TESTER_ALLOW_PRIVATE"} and key not in os.environ:
+             os.environ[key] = value.strip().strip("\"'")
+ 
+ 
+-- 
+2.42.0.windows.2
+

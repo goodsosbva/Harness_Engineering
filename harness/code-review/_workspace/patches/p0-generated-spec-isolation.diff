@@ -1,0 +1,150 @@
+diff --git a/api/playwright_runner.py b/api/playwright_runner.py
+--- a/api/playwright_runner.py
++++ b/api/playwright_runner.py
+@@ -13,6 +13,33 @@ from urllib.request import urlopen
+ 
+ 
+ ROOT = Path(__file__).resolve().parents[1]
++# 생성 코드가 실행되는 하위 프로세스에는 이 목록의 환경변수만 넘긴다.
++CHILD_ENV_KEYS = (
++    "PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TEMP", "TMP",
++    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "APPDATA", "PROGRAMDATA",
++    "PLAYWRIGHT_BROWSERS_PATH", "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
++)
++SPEC_IMPORTS = {"@playwright/test", "../../../../playwright-observations"}
++# ponytail: 정규식 거부 목록이라 난독화로 우회 가능하다. 실제 경계는 컨테이너/저권한 계정 격리로 옮겨야 한다.
++SPEC_FORBIDDEN = re.compile(
++    r"\b(?:require|eval|Function|constructor|globalThis|child_process|fs|fetch|Buffer)\b"
++    r"""|\bimport\s*\((?!\s*['"]@playwright/test['"]\s*\))|\\u|\bprocess\b(?!\.env\.COMMON_TESTER_TARGET_URL\b)"""
++)
++
++
++def child_env(**extra: str) -> dict:
++    env = {key: os.environ[key] for key in CHILD_ENV_KEYS if key in os.environ}
++    env.update(extra)
++    return env
++
++
++def check_spec_source(name: str, content: str) -> None:
++    for module in re.findall(r"""\b(?:from|import)\s*['"]([^'"]+)['"]""", content):
++        if module not in SPEC_IMPORTS:
++            raise RuntimeError(f"허용되지 않은 import가 있습니다: {name}: {module}")
++    found = SPEC_FORBIDDEN.search(content)
++    if found:
++        raise RuntimeError(f"생성 테스트에 허용되지 않은 코드가 있습니다: {name}: {found.group(0)}")
+ 
+ 
+ def run_folder(run_id: str) -> Path:
+@@ -77,21 +104,21 @@ def run_playwright(run_id: str, target_url: str | None = None) -> dict:
+     }
+     if files:
+         try:
++            for file in files:
++                check_spec_source(file.name, file.read_text(encoding="utf-8"))
+             with urlopen(target, timeout=10) as response:
+                 if response.status != 200:
+                     raise RuntimeError(f"대상 앱 응답이 200이 아닙니다: {response.status}")
+             node = shutil.which("node.exe") or shutil.which("node")
+             if not node:
+                 raise RuntimeError("Node.js 실행 파일이 없습니다.")
+-            env = os.environ.copy()
+-            env.pop("OPENAI_API_KEY", None)
+-            env.update({
+-                "COMMON_TESTER_TEST_DIR": str(generated),
+-                "COMMON_TESTER_OUTPUT_DIR": str(output / "test-results"),
+-                "COMMON_TESTER_REPORT": str(output / "playwright-results.json"),
+-                "COMMON_TESTER_TARGET_URL": target,
+-                "COMMON_TESTER_OBSERVATIONS": str(generated / "observations.json") if (generated / "observations.json").is_file() else "",
+-            })
++            env = child_env(
++                COMMON_TESTER_TEST_DIR=str(generated),
++                COMMON_TESTER_OUTPUT_DIR=str(output / "test-results"),
++                COMMON_TESTER_REPORT=str(output / "playwright-results.json"),
++                COMMON_TESTER_TARGET_URL=target,
++                COMMON_TESTER_OBSERVATIONS=str(generated / "observations.json") if (generated / "observations.json").is_file() else "",
++            )
+             command = [node, str(ROOT / "node_modules" / "@playwright" / "test" / "cli.js"), "test", "--config", str(ROOT / "playwright.config.ts")]
+             result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", timeout=300)
+             (output / "playwright.log").write_text(result.stdout + result.stderr, encoding="utf-8")
+diff --git a/api/codex_generator.py b/api/codex_generator.py
+--- a/api/codex_generator.py
++++ b/api/codex_generator.py
+@@ -11,6 +11,7 @@ import time
+ from pathlib import Path
+ from target_url import validate_target_url
+ from page_inspector import inspect_target
++from playwright_runner import check_spec_source, child_env
+ 
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+@@ -22,8 +23,8 @@ class CodexAppServer:
+         executable = os.getenv("CODEX_CLI_PATH") or shutil.which("codex.exe")
+         if not executable:
+             raise RuntimeError("Codex CLI 실행 파일을 찾지 못했습니다.")
+-        env = os.environ.copy()
+-        env.pop("OPENAI_API_KEY", None)
++        # Codex 로그인 정보는 USERPROFILE\\.codex 또는 CODEX_HOME에서 읽는다.
++        env = child_env(**{key: os.environ[key] for key in ("CODEX_HOME",) if key in os.environ})
+         self.process = subprocess.Popen(
+             [executable, "app-server", "--listen", "stdio://"],
+             cwd=cwd,
+@@ -192,18 +193,22 @@ coverage.json must be {{"scenarios":[{{"scenario_key":"...", "status":"generated
+         content = path.read_text(encoding="utf-8")
+         if "playwright-observations" not in content or "test(" not in content:
+             raise RuntimeError(f"Playwright 테스트 파일 형식이 아닙니다: {path.name}")
++        check_spec_source(path.name, content)
+ 
+     listing = ""
+     listed_count = 0
+     listed_files = 0
+     if files:
+-        env = os.environ.copy()
+-        env.pop("OPENAI_API_KEY", None)
+-        env["COMMON_TESTER_TEST_DIR"] = str(output_dir)
+-        env["COMMON_TESTER_OUTPUT_DIR"] = str(run_dir / "playwright-output")
+-        env["COMMON_TESTER_REPORT"] = str(run_dir / "playwright-list.json")
+-        command = f'"{ROOT / "node_modules" / ".bin" / "playwright.cmd"}" test --list --reporter=line'
+-        result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", timeout=120, shell=True)
++        node = shutil.which("node.exe") or shutil.which("node")
++        if not node:
++            raise RuntimeError("Node.js 실행 파일이 없습니다.")
++        env = child_env(
++            COMMON_TESTER_TEST_DIR=str(output_dir),
++            COMMON_TESTER_OUTPUT_DIR=str(run_dir / "playwright-output"),
++            COMMON_TESTER_REPORT=str(run_dir / "playwright-list.json"),
++        )
++        command = [node, str(ROOT / "node_modules" / "@playwright" / "test" / "cli.js"), "test", "--list", "--reporter=line", "--config", str(ROOT / "playwright.config.ts")]
++        result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", timeout=120)
+         listing = result.stdout + result.stderr
+         if result.returncode:
+             raise RuntimeError(f"Playwright가 생성 파일을 읽지 못했습니다.\n{listing[-4000:]}")
+diff --git a/api/check_spec_gate.py b/api/check_spec_gate.py
+new file mode 100644
+--- /dev/null
++++ b/api/check_spec_gate.py
+@@ -0,0 +1,25 @@
++"""Reject generated specs that reach outside the browser test API, and keep child env minimal."""
++import os
++from unittest.mock import patch
++
++from playwright_runner import check_spec_source, child_env
++
++ok = """import { test, expect } from '../../../../playwright-observations';
++const target = process.env.COMMON_TESTER_TARGET_URL || 'http://127.0.0.1:8765/';
++async function open(page: import('@playwright/test').Page) { await page.goto(target); }
++test('S1 deny', async ({ page }) => { await open(page); await expect(page.locator('#x')).toBeDisabled(); });"""
++check_spec_source('ok.spec.ts', ok)
++bad = ["import { execSync } from 'child_process';", "import fs from 'node:fs';", "process.env.OPENAI_API_KEY",
++       "require('fs')", "await import('os')", "eval('1')", "x.constructor.constructor('return 1')()",
++       "\u0072equire('fs')", "fetch('http://169.254.169.254/')", "process.exit(1)"]
++for line in bad:
++    try:
++        check_spec_source('bad.spec.ts', ok + '\n' + line)
++    except RuntimeError:
++        continue
++    raise AssertionError('passed: ' + line)
++with patch.dict(os.environ, {'OPENAI_API_KEY': 'x', 'AWS_SECRET_ACCESS_KEY': 'y', 'PATH': 'p'}):
++    env = child_env(COMMON_TESTER_TEST_DIR='d')
++assert env['PATH'] == 'p' and env['COMMON_TESTER_TEST_DIR'] == 'd'
++assert 'OPENAI_API_KEY' not in env and 'AWS_SECRET_ACCESS_KEY' not in env
++print('spec gate ok')
