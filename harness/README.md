@@ -8,7 +8,6 @@
 | [fullstack_function](fullstack_function) | 풀스택 구현 8인 팀 | Phase별 조합 (계층·파이프라인·팬아웃·생성-검증) | [구조](fullstack_function/wiki/02_풀스택팀_구조설명.md) · [쌓기](fullstack_function/wiki/03_풀스택팀_하네스_직접쌓기.md) · [배운 점](fullstack_function/wiki/04_풀스택팀_배운점.md) · [verifier 수정본](fullstack_function/wiki/05_boundary-verifier_수정본.md) | — |
 | [legacy_migration](legacy_migration) | 레거시 마이그레이션 팀 | 감독자 + 생성-검증 | [실습기](legacy_migration/wiki/레거시마이그레이션_실습기.md) · [쌓기 가이드](legacy_migration/wiki/06_레거시마이그레이션팀_하네스_쌓기.md) | [`fullstack_function/result/`](fullstack_function/result) ※ |
 | [debug_rca](debug_rca) | 디버깅 근본 원인 분석 팀 | — | — | [`result/BUG-001/`](debug_rca/result/BUG-001) |
-| [skills-example](skills-example/task-keeper) | 프로젝트 스킬 6종 (이슈 → 커밋 → PR → 리뷰 → 리뷰 반영) | 스킬 체이닝 | [실습기](skills-example/task-keeper/wiki/00_스킬_워크플로_실습기.md) | [task-keeper#1](https://github.com/goodsosbva/task-keeper/issues/1), [#2](https://github.com/goodsosbva/task-keeper/pull/2), [`wiki/`](skills-example/task-keeper/wiki) |
 
 ※ 마이그레이션 결과 문서는 실행 당시 지시에 따라 `fullstack_function/result/`에 정리되어 있습니다.
 
